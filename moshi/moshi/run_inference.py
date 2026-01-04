@@ -14,6 +14,7 @@ import numpy as np
 import sentencepiece
 import sphn
 import torch
+from safetensors.torch import save_file
 
 from .client_utils import AnyPrinter, Printer, RawPrinter, log
 from .conditioners import ConditionAttributes, ConditionTensors
@@ -102,6 +103,9 @@ class InferenceState:
         out_text_tokens_per_item: list[list[torch.Tensor]] = [
             [] for _ in range(self.batch_size)
         ]
+        out_audio_tokens_per_item: list[list[torch.Tensor]] = [
+            [] for _ in range(self.batch_size)
+        ]
         # For the Hibiki translation model, we feed a special token for the end of the input stream,
         # which corresponds to `2048` on all the codebooks of the audio stream, and wait
         # for the EOS on the output text stream to be emitted, as indication that the model is done.
@@ -188,6 +192,7 @@ class InferenceState:
 
                     out_text_tokens_per_item[b].append(one_text)
                     out_pcms_per_item[b].append(one_pcm)
+                    out_audio_tokens_per_item[b].append(tokens[b, 1:].cpu())
                     if b == 0:
                         if one_text.item() not in [0, 3]:
                             text = self.text_tokenizer.id_to_piece(one_text.item())  # pyright: ignore
@@ -207,9 +212,9 @@ class InferenceState:
         )
         if self.lm_gen.lm_model.dep_q > 0:
             out = [
-                (torch.cat(one_texts, dim=0), torch.cat(one_pcms, dim=1))
-                for one_texts, one_pcms in zip(
-                    out_text_tokens_per_item, out_pcms_per_item
+                (torch.cat(one_texts, dim=0), torch.cat(one_audio_tokens, dim=1))
+                for one_texts, one_audio_tokens in zip(
+                    out_text_tokens_per_item, out_audio_tokens_per_item
                 )
             ]
             return out
@@ -266,6 +271,12 @@ def main():
         nargs="?",
         default="",
     )
+    parser.add_argument(
+        "--mimi-out",
+        type=str,
+        default="",
+        help="Output Mimi audio tokens in .safetensors format.",
+    )
 
     args = parser.parse_args()
     seed_all(4242)
@@ -286,6 +297,8 @@ def main():
 
     log("info", f"loading input file {args.infile}")
     in_pcms, _ = sphn.read(args.infile, sample_rate=mimi.sample_rate)
+    if in_pcms.ndim > 1 and in_pcms.shape[0] > 1:
+        in_pcms = in_pcms.mean(axis=0, keepdims=True)
     in_pcms = torch.from_numpy(in_pcms).to(device=args.device)
     in_pcms = in_pcms[None, 0:1].expand(args.batch_size, -1, -1)
 
@@ -303,15 +316,32 @@ def main():
 
     if args.outfile:
         outfile = Path(args.outfile)
-        for index, (_, out_pcm) in enumerate(out_items):
+        for index, (_, out_audio_tokens) in enumerate(out_items):
             if len(out_items) > 1:
                 outfile_ = outfile.with_name(f"{outfile.stem}-{index}{outfile.suffix}")
             else:
                 outfile_ = outfile
-            duration = out_pcm.shape[1] / mimi.sample_rate
+            out_pcm = mimi.decode(out_audio_tokens.unsqueeze(0).to(device=args.device)).cpu()
+            duration = out_pcm.shape[2] / mimi.sample_rate
             log("info", f"writing {outfile_} with duration {duration:.1f} sec.")
             sphn.write_wav(
                 str(outfile_), out_pcm[0].numpy(), sample_rate=mimi.sample_rate
+            )
+    if args.mimi_out:
+        mimi_outfile = Path(args.mimi_out)
+        for index, (out_text_tokens, out_audio_tokens) in enumerate(out_items):
+            if len(out_items) > 1:
+                mimi_outfile_ = mimi_outfile.with_name(
+                    f"{mimi_outfile.stem}-{index}{mimi_outfile.suffix}"
+                )
+            else:
+                mimi_outfile_ = mimi_outfile
+            save_file(
+                {
+                    "audio_tokens": out_audio_tokens.cpu(),
+                    "text_tokens": out_text_tokens.cpu(),
+                },
+                mimi_outfile_,
             )
 
 
