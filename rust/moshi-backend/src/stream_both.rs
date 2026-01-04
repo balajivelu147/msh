@@ -185,6 +185,10 @@ pub enum StreamOut {
 // https://opus-codec.org/docs/opus_api-1.2/group__opus__encoder.html#ga4ae9905859cd241ef4bb5c59cd5e5309
 const OPUS_ENCODER_FRAME_SIZE: usize = 960;
 const OPUS_TARGET_BITRATE_BPS: i32 = 24_000;
+const WS_AUDIO_FLUSH_BYTES: usize = 12_000;
+const WS_AUDIO_FLUSH_PAGES: usize = 3;
+const WS_AUDIO_BUF_CAPACITY: usize = 64 * 1024;
+const WS_MSG_BUF_CAPACITY: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub enum MsgType {
@@ -230,6 +234,9 @@ pub struct MsgSender {
     encoder: opus::Encoder,
     out_pcm: std::collections::VecDeque<f32>,
     out_pcm_buf: Vec<u8>,
+    ws_audio_buf: Vec<u8>,
+    ws_msg_buf: Vec<u8>,
+    pending_audio_pages: usize,
     total_data: usize,
     sender: SplitSink<ws::WebSocket, ws::Message>,
 }
@@ -244,6 +251,8 @@ impl MsgSender {
         // Not sure what the appropriate buffer size would be here.
         let out_pcm_buf = vec![0u8; 50_000];
         let out_pcm = std::collections::VecDeque::with_capacity(2 * OPUS_ENCODER_FRAME_SIZE);
+        let ws_audio_buf = Vec::with_capacity(WS_AUDIO_BUF_CAPACITY);
+        let ws_msg_buf = Vec::with_capacity(WS_MSG_BUF_CAPACITY);
 
         let all_data = Vec::new();
         let mut pw = ogg::PacketWriter::new(all_data);
@@ -253,13 +262,21 @@ impl MsgSender {
         let mut tags = Vec::new();
         crate::audio::write_opus_tags(&mut tags)?;
         pw.write_packet(tags, 42, ogg::PacketWriteEndInfo::EndPage, 0)?;
-        Ok(Self { pw, encoder, out_pcm, out_pcm_buf, total_data: 0, sender })
+        Ok(Self {
+            pw,
+            encoder,
+            out_pcm,
+            out_pcm_buf,
+            ws_audio_buf,
+            ws_msg_buf,
+            pending_audio_pages: 0,
+            total_data: 0,
+            sender,
+        })
     }
 
     async fn send_text(&mut self, text: String) -> Result<()> {
-        let msg: Vec<u8> = [&[MsgType::Text.to_u8()], text.as_bytes()].concat();
-        let msg = ws::Message::Binary(msg.into());
-        self.sender.send(msg).await?;
+        self.send_buffered_msg(MsgType::Text, text.as_bytes()).await?;
         Ok(())
     }
 
@@ -267,17 +284,13 @@ impl MsgSender {
         // The payload is made of two fields.
         // 1. Protocol version (`u32`) - always 0 for now.
         // 2. Model version (`u32`).
-        let msg: Vec<u8> = [&[MsgType::Handshake.to_u8()], [0u8; 8].as_slice()].concat();
-        let msg = ws::Message::Binary(msg.into());
-        self.sender.send(msg).await?;
+        self.send_buffered_msg(MsgType::Handshake, &[0u8; 8]).await?;
         Ok(())
     }
 
     async fn send_metadata(&mut self, md: Box<MetaData>) -> Result<()> {
         let bytes = serde_json::to_vec(&md)?;
-        let msg: Vec<u8> = [&[MsgType::Metadata.to_u8()], bytes.as_slice()].concat();
-        let msg = ws::Message::Binary(msg.into());
-        self.sender.send(msg).await?;
+        self.send_buffered_msg(MsgType::Metadata, &bytes).await?;
         Ok(())
     }
 
@@ -308,14 +321,55 @@ impl MsgSender {
             }
             let data = self.pw.inner_mut();
             if !data.is_empty() {
-                let msg: Vec<u8> = [&[MsgType::Audio.to_u8()], data.as_slice()].concat();
-                let msg = ws::Message::Binary(msg.into());
-                self.sender.send(msg).await?;
-                self.sender.flush().await?;
+                self.append_audio_data(data);
                 data.clear();
             } else {
                 tracing::error!("OGG SIZE 0")
             }
+            if self.should_flush_audio() {
+                self.flush_audio_buffer(false).await?;
+            }
+        }
+        self.flush_audio_buffer(true).await?;
+        Ok(())
+    }
+
+    async fn send_buffered_msg(&mut self, msg_type: MsgType, payload: &[u8]) -> Result<()> {
+        self.ws_msg_buf.clear();
+        self.ws_msg_buf.push(msg_type.to_u8());
+        self.ws_msg_buf.extend_from_slice(payload);
+        let msg = ws::Message::Binary(std::mem::take(&mut self.ws_msg_buf).into());
+        self.sender.send(msg).await?;
+        if self.ws_msg_buf.capacity() < WS_MSG_BUF_CAPACITY {
+            self.ws_msg_buf = Vec::with_capacity(WS_MSG_BUF_CAPACITY);
+        }
+        Ok(())
+    }
+
+    fn append_audio_data(&mut self, data: &[u8]) {
+        if self.ws_audio_buf.is_empty() {
+            self.ws_audio_buf.push(MsgType::Audio.to_u8());
+        }
+        self.ws_audio_buf.extend_from_slice(data);
+        self.pending_audio_pages += 1;
+    }
+
+    fn should_flush_audio(&self) -> bool {
+        self.ws_audio_buf.len() >= WS_AUDIO_FLUSH_BYTES
+            || self.pending_audio_pages >= WS_AUDIO_FLUSH_PAGES
+    }
+
+    async fn flush_audio_buffer(&mut self, force_flush: bool) -> Result<()> {
+        if self.ws_audio_buf.len() > 1 {
+            let msg = ws::Message::Binary(std::mem::take(&mut self.ws_audio_buf).into());
+            self.sender.send(msg).await?;
+            if force_flush {
+                self.sender.flush().await?;
+            }
+            if self.ws_audio_buf.capacity() < WS_AUDIO_BUF_CAPACITY {
+                self.ws_audio_buf = Vec::with_capacity(WS_AUDIO_BUF_CAPACITY);
+            }
+            self.pending_audio_pages = 0;
         }
         Ok(())
     }
