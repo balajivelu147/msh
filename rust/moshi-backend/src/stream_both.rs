@@ -184,6 +184,7 @@ pub enum StreamOut {
 // Using a different value would result in a BadArg "invalid argument" error when calling encode.
 // https://opus-codec.org/docs/opus_api-1.2/group__opus__encoder.html#ga4ae9905859cd241ef4bb5c59cd5e5309
 const OPUS_ENCODER_FRAME_SIZE: usize = 960;
+const OPUS_TARGET_BITRATE_BPS: i32 = 24_000;
 
 #[derive(Debug, Clone, Copy)]
 pub enum MsgType {
@@ -235,7 +236,11 @@ pub struct MsgSender {
 
 impl MsgSender {
     fn new(sender: SplitSink<ws::WebSocket, ws::Message>) -> Result<Self> {
-        let encoder = opus::Encoder::new(24000, opus::Channels::Mono, opus::Application::Voip)?;
+        let mut encoder =
+            opus::Encoder::new(24000, opus::Channels::Mono, opus::Application::Voip)?;
+        encoder.set_bitrate(opus::Bitrate::Bits(OPUS_TARGET_BITRATE_BPS))?;
+        encoder.set_vbr(true)?;
+        encoder.set_vbr_constraint(true)?;
         // Not sure what the appropriate buffer size would be here.
         let out_pcm_buf = vec![0u8; 50_000];
         let out_pcm = std::collections::VecDeque::with_capacity(2 * OPUS_ENCODER_FRAME_SIZE);
